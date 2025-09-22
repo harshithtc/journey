@@ -1,2 +1,2 @@
-<b> Journey <b>
-tour planner
+<p><strong> Journey </strong><p>
+<p>tour planner<p>
