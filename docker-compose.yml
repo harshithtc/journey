@@ -1,0 +1,19 @@
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: fastapi-backend:latest
+    container_name: fastapi-container
+    env_file:
+      - .env
+    ports:
+      - "8000:80"            # host:container
+    restart: unless-stopped
+    healthcheck:
+      # Use curl if present in the image; otherwise use wget
+      test: ["CMD-SHELL", "wget -qO- http://localhost/ping || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s

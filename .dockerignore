@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.log
+
+# Virtual envs
+.venv/
+venv/
+
+# VCS / tooling
+.git/
+.gitignore
+.vscode/
+.idea/
+
+# Builds / caches
+dist/
+build/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Local env/config
+.env
+.env.*
