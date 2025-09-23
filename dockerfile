@@ -1,5 +1,5 @@
 # Base (keeps runtime minimal)
-FROM python:3.11-slim AS base
+FROM python:3.11-slim-bookworm AS base
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 WORKDIR /app
@@ -8,8 +8,10 @@ WORKDIR /app
 FROM base AS builder
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential gcc \
-    && rm -rf /var/lib/apt/lists/*    # keep image small
+    && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
+# Upgrade setuptools to patched version
+RUN pip install --upgrade pip setuptools>=78.1.1
 RUN pip wheel --no-cache-dir --wheel-dir /wheels -r requirements.txt
 
 # Runtime (no compilers, install from wheels)
@@ -29,5 +31,5 @@ RUN groupadd -g 10001 appuser \
 USER appuser
 
 EXPOSE 80
-# FastAPI’s CLI is the current recommended simple entrypoint
-CMD ["fastapi", "run", "app/main.py", "--port", "80"]
+# Use Uvicorn for production
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "80"]
