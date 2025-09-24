@@ -21,6 +21,9 @@ from app.models.itinerary_models import PlanTripRequest, DayPlan, ItineraryRespo
 from app.services.perplexity_service import safe_perplexity_call, safe_itinerary_call
 from app.services.logging_config import setup_logging
 
+from pydantic import BaseModel
+from typing import Optional
+
 # ------------------------------------------------------------------------------
 # Logging
 # ------------------------------------------------------------------------------
@@ -32,8 +35,7 @@ logger = setup_logging()
 limiter = Limiter(key_func=get_remote_address)
 
 # ------------------------------------------------------------------------------
-# Lifespan: do one-time startup work (e.g., table creation for dev)
-# Prefer Alembic for production migrations.
+# Lifespan
 # ------------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(_: FastAPI):
@@ -48,11 +50,11 @@ async def lifespan(_: FastAPI):
     yield
 
 # ------------------------------------------------------------------------------
-# App
+# App creation
 # ------------------------------------------------------------------------------
 app = FastAPI(title=APP_NAME, version="1.0.0", lifespan=lifespan)
 
-# SlowAPI wiring
+# SlowAPI integration
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 app.add_middleware(SlowAPIMiddleware)
@@ -60,13 +62,13 @@ app.add_middleware(SlowAPIMiddleware)
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # tighten for production
+    allow_origins=["*"],  # tighten for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Routers (additional feature modules) with explicit tags for documentation
+# Include existing app routers
 app.include_router(tours, tags=["Tours"])
 
 # ------------------------------------------------------------------------------
@@ -93,7 +95,7 @@ async def log_requests(request: Request, call_next):
     return response
 
 # ------------------------------------------------------------------------------
-# Health
+# Health check
 # ------------------------------------------------------------------------------
 @app.get("/ping")
 async def ping():
@@ -101,18 +103,86 @@ async def ping():
     return {"status": "ok", "service": "journey-backend"}
 
 # ------------------------------------------------------------------------------
-# Chat
+# Conversational chat state and questions
 # ------------------------------------------------------------------------------
+chat_state = {}
+
+CONVERSATION_QUESTIONS = [
+    ("day", "Which day are you planning your tour?"),
+    ("location", "Which city/country/region do you want to visit?"),
+    ("date", "What are your preferred travel dates?"),
+    ("travel_style", "Are you looking for luxury, mid-range, or budget travel?"),
+    ("budget", "Approximate budget per person (including accommodation, food, transport, activities)?"),
+    ("accommodation", "Do you prefer hotels, hostels, resorts, or homestays?"),
+    ("activities", "What kind of experiences are you interested in? (nature, adventure, cultural experiences, shopping, nightlife)"),
+    ("transportation", "How do you prefer to travel locally? (rental car, public transport, walking, bike)"),
+    ("dining", "Do you have any dietary restrictions or food interests?"),
+    ("special_requests", "Any special requests, accessibility needs, or events you want included?")
+]
+
+class ChatInput(BaseModel):
+    user_id: Optional[str] = "default_user"  # In production: get from actual session or auth
+    day: Optional[str] = None
+    location: Optional[str] = None
+    date: Optional[str] = None
+    travel_style: Optional[str] = None
+    budget: Optional[str] = None
+    accommodation: Optional[str] = None
+    activities: Optional[str] = None
+    transportation: Optional[str] = None
+    dining: Optional[str] = None
+    special_requests: Optional[str] = None
+    query: Optional[str] = None
+
 @app.post("/chat")
 @limiter.limit("10/minute")
-async def chat(request: Request, chat_request: ChatRequest):
-    logger.info("Chat request received", extra={"query_length": len(chat_request.query or "")})
+async def chat_endpoint(request: Request, chat_input: ChatInput):
+    user_id = chat_input.user_id or "default_user"
+    if user_id not in chat_state:
+        chat_state[user_id] = {}
 
+    state = chat_state[user_id]
+
+    # Update conversation state with any new info from client
+    for key, _ in CONVERSATION_QUESTIONS:
+        val = getattr(chat_input, key, None)
+        if val is not None:
+            state[key] = val
+
+    # Ask the next unanswered question
+    for key, question in CONVERSATION_QUESTIONS:
+        if key not in state:
+            return {"response": question}
+
+    # All questions answered: create prompt and call Perplexity API
+    prompt = f"""
+You are a professional travel planner AI. Based on these user preferences, create a detailed day-wise itinerary:
+{json.dumps(state, indent=2)}
+Return just the JSON formatted itinerary without extra text.
+"""
+
+    try:
+        ai_response = await safe_perplexity_call(prompt)
+    except Exception as e:
+        logger.error("Perplexity API call failed", exc_info=e)
+        ai_response = "Sorry, I couldn't generate the itinerary at this time."
+
+    # Clear conversation state
+    chat_state.pop(user_id, None)
+
+    return {"response": ai_response}
+
+# ------------------------------------------------------------------------------
+# Legacy chat endpoint using external AI call (kept for backward compatibility)
+# ------------------------------------------------------------------------------
+@app.post("/legacy_chat")
+@limiter.limit("10/minute")
+async def legacy_chat(request: Request, chat_request: ChatRequest):
+    logger.info("Chat request received", extra={"query_length": len(chat_request.query or "")})
     q = (chat_request.query or "").strip()
     if q == "":
         logger.info("Empty query short-circuited")
         return {"reply": ""}
-
     try:
         reply = safe_perplexity_call(q)
         logger.info("Chat response generated successfully")
@@ -124,91 +194,5 @@ async def chat(request: Request, chat_request: ChatRequest):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 # ------------------------------------------------------------------------------
-# Trip planning
+# Your other existing endpoints like /plan_trip etc.
 # ------------------------------------------------------------------------------
-@app.post("/plan_trip", response_model=ItineraryResponse)
-@limiter.limit("5/minute")
-async def plan_trip(request: Request, req: PlanTripRequest) -> ItineraryResponse:
-    logger.info(
-        "Trip planning request received",
-        extra={
-            "city": req.city,
-            "start_date": str(req.start_date),
-            "end_date": str(req.end_date),
-            "trip_days": (req.end_date - req.start_date).days + 1,
-        },
-    )
-
-    system_msg = "You are a travel planner that responds strictly with valid JSON for the requested schema."
-    user_prompt = f"""
-    Generate a day-wise itinerary for city "{req.city}" from "{req.start_date}" to "{req.end_date}".
-    Return strictly valid JSON only, matching exactly:
-    {{
-        "city": "{req.city}",
-        "start_date": "{req.start_date}",
-        "end_date": "{req.end_date}",
-        "days": [
-            {{
-                "day": 1,
-                "date": "{req.start_date}",
-                "summary": "One-sentence highlight for the day",
-                "activities": ["Short actionable activity 1", "Activity 2", "Activity 3"]
-            }}
-        ]
-    }}
-    No extra text before or after the JSON, no markdown, no code fences.
-    """
-
-    try:
-        ai_response = safe_itinerary_call(system_msg, user_prompt)
-        data = json.loads(ai_response)
-        itinerary = ItineraryResponse.model_validate(data)
-        logger.info("AI itinerary generated successfully")
-        return itinerary
-
-    except (json.JSONDecodeError, ValueError, HTTPException) as e:
-        logger.warning("AI itinerary failed, using fallback", extra={"error": str(e)})
-
-        total_days = (req.end_date - req.start_date).days + 1
-        suggestions = [
-            f"Explore iconic landmarks in {req.city}",
-            "Sample local cuisine at a recommended spot",
-            "Visit a museum, gallery, or cultural center",
-            "Walk through scenic neighborhoods or parks",
-        ]
-
-        days: list[DayPlan] = []
-        for i in range(total_days):
-            day_date = req.start_date + timedelta(days=i)
-            activities = suggestions[:3] if i % 2 == 0 else suggestions[1:]
-            days.append(
-                DayPlan(
-                    day=i + 1,
-                    date=day_date,
-                    summary=f"Discover highlights of {req.city}",
-                    activities=activities,
-                )
-            )
-
-        fallback_itinerary = ItineraryResponse(
-            city=req.city,
-            start_date=req.start_date,
-            end_date=req.end_date,
-            days=days,
-        )
-
-        logger.info("Fallback itinerary generated")
-        return fallback_itinerary
-
-# ------------------------------------------------------------------------------
-# Local entrypoint (Render uses its own start command)
-# ------------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=int(os.getenv("PORT", "8000")),
-        reload=bool(os.getenv("RELOAD", "0") == "1"),
-    )
