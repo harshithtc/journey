@@ -8,11 +8,10 @@ services:
     env_file:
       - .env
     ports:
-      - "8000:80"            # host:container
+      - "8000:10000"  # map host port 8000 to container port 10000 (matches Dockerfile's EXPOSE & CMD)
     restart: unless-stopped
     healthcheck:
-      # Use curl if present in the image; otherwise use wget
-      test: ["CMD-SHELL", "wget -qO- http://localhost/ping || exit 1"]
+      test: ["CMD-SHELL", "wget -qO- http://localhost:10000/ping || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
